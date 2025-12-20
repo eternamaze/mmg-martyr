@@ -1,0 +1,9 @@
+[package]
+name = "mmg-martyr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+slotmap = "1.1.1"
+parking_lot = "0.12.5"
+tracing = "0.1"
