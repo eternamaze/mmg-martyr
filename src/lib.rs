@@ -1,13 +1,9 @@
 #![allow(clippy::disallowed_types)]
 
 use parking_lot::RwLock;
-use slotmap::{new_key_type, SlotMap};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, Weak};
-
-// Define the key type internally, but don't expose it as the primary way to access.
-new_key_type! { struct ResourceKey; }
 
 /// Discipline defines how to handle violations (e.g., accessing a killed resource).
 pub trait Discipline: Send + Sync + 'static {
@@ -32,96 +28,85 @@ struct ResourceStatus {
 /// The cell holding the resource and its status.
 struct SovereignCell<T> {
     instance: T,
-    status: Arc<ResourceStatus>,
+    status: ResourceStatus,
 }
 
-/// Internal storage.
-struct RegistryInternal<T> {
-    // Use Arc<SovereignCell> to allow access without holding the map lock for the entire duration.
-    // This ensures force_kill can acquire the write lock immediately even if a visitor is looping.
-    storage: RwLock<SlotMap<ResourceKey, Arc<SovereignCell<T>>>>,
-}
-
-/// The Sovereign container. Manages the lifecycle of resources `T`.
+/// The Sovereign container. Manages the lifecycle of a single resource `T`.
+/// It holds the strong ownership of the resource.
 pub struct Sovereign<T, D: Discipline = PanicDiscipline> {
-    internal: Arc<RegistryInternal<T>>,
+    // We use RwLock<Option<Arc>> to allow "taking" the resource out (killing it)
+    // while the Sovereign struct itself remains valid (but empty).
+    // This is crucial for explicit kill operations.
+    inner: RwLock<Option<Arc<SovereignCell<T>>>>,
     _marker: PhantomData<D>,
 }
 
-impl<T, D: Discipline> Default for Sovereign<T, D> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<T, D: Discipline> Sovereign<T, D> {
-    pub fn new() -> Self {
-        Self {
-            internal: Arc::new(RegistryInternal {
-                storage: RwLock::new(SlotMap::with_key()),
-            }),
-            _marker: PhantomData,
-        }
-    }
-
-    /// Register a resource and get a Lease (handle) to it.
-    pub fn register(&self, resource: T) -> Lease<T, D> {
-        let mut map = self.internal.storage.write();
-        let key = map.insert(Arc::new(SovereignCell {
+    /// Create a new Sovereign container protecting the given resource.
+    /// Returns the Sovereign (Owner) and a Lease (Weak Handle).
+    pub fn new(resource: T) -> (Self, Lease<T, D>) {
+        let cell = Arc::new(SovereignCell {
             instance: resource,
-            status: Arc::new(ResourceStatus {
+            status: ResourceStatus {
                 visitor_count: AtomicIsize::new(0),
                 is_killed: AtomicBool::new(false),
-            }),
-        }));
+            },
+        });
 
-        Lease {
-            registry: Arc::downgrade(&self.internal),
-            key,
+        let lease = Lease {
+            cell: Arc::downgrade(&cell),
             _marker: PhantomData,
-        }
+        };
+
+        let sovereign = Self {
+            inner: RwLock::new(Some(cell)),
+            _marker: PhantomData,
+        };
+
+        (sovereign, lease)
     }
 
-    /// Forcefully kill a resource associated with the given Lease.
-    /// This will prevent future access and panic if there are active visitors.
-    pub fn force_kill(&self, lease: &Lease<T, D>) {
-        let mut map = self.internal.storage.write();
-        
-        // Remove the cell from the map immediately.
-        // Even if visitors are holding Arc<Cell>, they can't prevent us from removing the entry.
-        if let Some(cell) = map.remove(lease.key) {
+    /// Kill the resource immediately.
+    /// This will:
+    /// 1. Mark the resource as killed (preventing new visitors).
+    /// 2. Check for active visitors (panic if any).
+    /// 3. Drop the strong reference to the resource (physically releasing it if no visitors).
+    pub fn kill(&self) {
+        let mut lock = self.inner.write();
+        if let Some(cell) = lock.take() {
             // 1. Signal Kill
             cell.status.is_killed.store(true, Ordering::SeqCst);
 
             // 2. Check for lingering visitors
             let visitors = cell.status.visitor_count.load(Ordering::SeqCst);
             if visitors > 0 {
-                // Punishment: The visitor is still running (maybe in a loop).
-                // We panic here to crash the thread/process.
                 panic!("💥 [Martyr] Force kill executed! {} visitors lingering. System self-destruct.", visitors);
             }
 
-            // 3. Resource logic drop.
-            // Note: Since visitors might hold Arc<Cell>, the physical drop of T happens when the last visitor exits (or crashes).
-            // But logically, it is killed.
+            // 3. Drop Arc (happens when `cell` goes out of scope here)
             tracing::info!("✅ [Martyr] Resource killed.");
         }
+    }
+}
+
+impl<T, D: Discipline> Drop for Sovereign<T, D> {
+    fn drop(&mut self) {
+        // Ensure we kill properly on drop
+        self.kill();
     }
 }
 
 /// A Lease is a safe handle to a sovereign resource.
 /// It does not own the resource, but allows controlled access.
 pub struct Lease<T, D: Discipline = PanicDiscipline> {
-    registry: Weak<RegistryInternal<T>>,
-    key: ResourceKey,
+    cell: Weak<SovereignCell<T>>,
     _marker: PhantomData<D>,
 }
 
 impl<T, D: Discipline> Clone for Lease<T, D> {
     fn clone(&self) -> Self {
         Self {
-            registry: self.registry.clone(),
-            key: self.key,
+            cell: self.cell.clone(),
             _marker: PhantomData,
         }
     }
@@ -135,13 +120,8 @@ impl<T, D: Discipline> Lease<T, D> {
     where
         F: FnOnce(&T) -> R,
     {
-        let registry = self.registry.upgrade().ok_or(AccessError::RegistryDropped)?;
-        
-        // 1. Get the cell. We only hold the read lock briefly to clone the Arc.
-        let cell = {
-            let map = registry.storage.read();
-            map.get(self.key).cloned().ok_or(AccessError::ResourceNotFound)?
-        };
+        // 1. Upgrade Weak to Arc. If fails, resource is gone.
+        let cell = self.cell.upgrade().ok_or(AccessError::ResourceNotFound)?;
 
         // 2. Check-in
         cell.status.visitor_count.fetch_add(1, Ordering::SeqCst);
@@ -157,22 +137,11 @@ impl<T, D: Discipline> Lease<T, D> {
         }
 
         // 4. Execute
-        // Note: If force_kill happens during f(), it will set is_killed and panic.
-        // But since we are in f(), we won't see the panic from force_kill thread unless force_kill thread panics the whole process.
-        // However, force_kill WILL succeed in removing the key and detecting us.
         let result = f(&cell.instance);
-
-        // 5. Check if killed (After execution - optional but good for detecting if we were killed during exec)
-        if cell.status.is_killed.load(Ordering::SeqCst) {
-             // If we survived the execution but were killed in the meantime, we should probably acknowledge it.
-             // But strictly speaking, we finished successfully.
-             // Let's stick to the entry check for now.
-        }
 
         Ok(result)
     }
 }
-
 
 struct VisitorGuard<'a> {
     status: &'a ResourceStatus,
@@ -186,8 +155,6 @@ impl<'a> Drop for VisitorGuard<'a> {
 
 #[derive(thiserror::Error, Debug)]
 pub enum AccessError {
-    #[error("Sovereign registry has been dropped")]
-    RegistryDropped,
     #[error("Resource not found or already killed")]
     ResourceNotFound,
 }
