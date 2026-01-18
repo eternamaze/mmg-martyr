@@ -1,3 +1,14 @@
+//! # Martyr - 主权内存模型
+//!
+//! 通过编译期生命周期禁锢实现零泄露资源管理。
+//!
+//! ## 安全保证
+//!
+//! - **引用不可逃逸**：HRTB (`for<'a>`) 确保闭包返回值不能携带资源引用
+//! - **访客审计**：运行时计数 + 殉道检查确保无滞留访客
+//! - **单点主权**：`Sovereign` 是唯一强所有者，`Lease` 仅为弱观察者
+
+// Arc/Weak 是内部实现细节，用户无法接触，此处豁免 clippy 检查
 #![allow(clippy::disallowed_types)]
 
 use parking_lot::RwLock;
@@ -33,6 +44,11 @@ struct SovereignCell<T> {
 
 /// The Sovereign container. Manages the lifecycle of a single resource `T`.
 /// It holds the strong ownership of the resource.
+///
+/// # 注意
+///
+/// 必须持有此值直到资源不再需要。丢弃 `Sovereign` 会触发殉道审计。
+#[must_use = "Sovereign 被丢弃会立即触发资源销毁和殉道审计，请确保持有它直到资源不再需要"]
 pub struct Sovereign<T, D: Discipline = PanicDiscipline> {
     // We use RwLock<Option<Arc>> to allow "taking" the resource out (killing it)
     // while the Sovereign struct itself remains valid (but empty).
@@ -66,6 +82,27 @@ impl<T, D: Discipline> Sovereign<T, D> {
         (sovereign, lease)
     }
 
+    /// Issue a new Lease to this Sovereign's resource.
+    ///
+    /// # Safety (Logical)
+    ///
+    /// This is safe because:
+    /// - Lease only holds a Weak reference (cannot extend lifetime)
+    /// - Lease cannot upgrade to strong reference (by design)
+    /// - Multiple Leases coexist safely
+    ///
+    /// # Returns
+    ///
+    /// - `Some(Lease)` if the resource is still alive
+    /// - `None` if the resource has been killed
+    pub fn issue_lease(&self) -> Option<Lease<T, D>> {
+        let lock = self.inner.read();
+        lock.as_ref().map(|cell| Lease {
+            cell: Arc::downgrade(cell),
+            _marker: PhantomData,
+        })
+    }
+
     /// Kill the resource immediately.
     /// This will:
     /// 1. Mark the resource as killed (preventing new visitors).
@@ -84,7 +121,7 @@ impl<T, D: Discipline> Sovereign<T, D> {
             }
 
             // 3. Drop Arc (happens when `cell` goes out of scope here)
-            tracing::info!("✅ [Martyr] Resource killed.");
+            tracing::debug!("✅ [Martyr] Resource killed cleanly.");
         }
     }
 }
@@ -113,12 +150,24 @@ impl<T, D: Discipline> Clone for Lease<T, D> {
 }
 
 impl<T, D: Discipline> Lease<T, D> {
-    /// Access the resource safely.
-    /// The closure `f` is executed within a "Sentry" context.
-    /// The resource reference `&T` cannot escape the closure.
+    /// 安全访问受保护资源。
+    ///
+    /// 闭包 `f` 在哨兵上下文中执行，资源引用 `&T` **不可能**逃逸出闭包。
+    ///
+    /// # 编译期安全保证
+    ///
+    /// 通过 `for<'a>` (HRTB) 约束，返回值 `R` 必须独立于资源的生命周期。
+    /// 任何尝试返回资源引用的代码都会在**编译期**被拒绝：
+    ///
+    /// ```compile_fail
+    /// # use mmg_martyr::{Sovereign, Lease};
+    /// # let (sovereign, lease) = Sovereign::<String>::new("data".into());
+    /// // 编译错误：返回值生命周期依赖闭包参数
+    /// let escaped: &str = lease.access("steal", |s| s.as_str()).unwrap();
+    /// ```
     pub fn access<F, R>(&self, action: &'static str, f: F) -> Result<R, AccessError>
     where
-        F: FnOnce(&T) -> R,
+        F: for<'a> FnOnce(&'a T) -> R,
     {
         // 1. Upgrade Weak to Arc. If fails, resource is gone.
         let cell = self.cell.upgrade().ok_or(AccessError::ResourceNotFound)?;
