@@ -8,9 +8,6 @@
 //! - **访客审计**：运行时计数 + 殉道检查确保无滞留访客
 //! - **单点主权**：`Sovereign` 是唯一强所有者，`Lease` 仅为弱观察者
 
-// Arc/Weak 是内部实现细节，用户无法接触，此处豁免 clippy 检查
-#![allow(clippy::disallowed_types)]
-
 use parking_lot::RwLock;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
