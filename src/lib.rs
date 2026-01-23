@@ -167,7 +167,7 @@ impl<T, D: Discipline> Lease<T, D> {
         F: for<'a> FnOnce(&'a T) -> R,
     {
         // 1. Upgrade Weak to Arc. If fails, resource is gone.
-        let cell = self.cell.upgrade().ok_or(AccessError::ResourceNotFound)?;
+        let cell = self.cell.upgrade().ok_or(AccessError::ResourceNotFound { resource: action })?;
 
         // 2. Check-in
         cell.status.visitor_count.fetch_add(1, Ordering::SeqCst);
@@ -201,6 +201,9 @@ impl<'a> Drop for VisitorGuard<'a> {
 
 #[derive(thiserror::Error, Debug)]
 pub enum AccessError {
-    #[error("Resource not found or already killed")]
-    ResourceNotFound,
+    #[error("resource '{resource}' not found or already released")]
+    ResourceNotFound {
+        /// 尝试访问的资源名称
+        resource: &'static str,
+    },
 }
