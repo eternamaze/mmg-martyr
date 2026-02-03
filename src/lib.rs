@@ -8,27 +8,27 @@
 //!
 //! ## 核心原则
 //!
-//! - **唯一指针**：系统中只有 Martyr 持有指向资源 T 的指针
-//! - **代理访问**：外部通过为 `Martyr<T>` 实现的 trait 代理操作，永远无法获得 `&T`
+//! - **唯一指针**：系统中只有 Martyr 持有指向资源 T 内存布局的指针
+//! - **代理访问**：外部通过 `__invoke` 代理操作，永远无法获得指向 T 的指针
 //! - **壳可共享**：Martyr 可以被 `Arc` 包裹共享，因为共享的只是"壳"
-//! - **资源不泄露**：T 的指针物理上只存在一份，kill 时必死无疑
+//! - **资源不泄露**：T 的内存布局物理上只有 Martyr 一个入口，kill 时必死无疑
 //!
 //! ## 双层防护
 //!
 //! ```text
 //! 外层（Martyr 负责）：HRTB 约束，防止 &T 逃逸
-//! 内层（Sealed 契约）：T 承诺不持有可泄露的共享指针
+//! 内层（NoLeakPledge 契约）：T 承诺不会通过方法返回指向自身内存布局的指针
 //! ```
 //!
 //! ## 使用方式
 //!
 //! ```ignore
-//! use mmg_martyr::{Martyr, Sealed};
+//! use mmg_martyr::{Martyr, NoLeakPledge};
 //!
 //! struct MyResource { /* ... */ }
 //!
 //! // 1. 声明遵守契约
-//! impl Sealed for MyResource {}
+//! impl NoLeakPledge for MyResource {}
 //!
 //! // 2. 为 Martyr<T> 实现 trait
 //! impl MyTrait for Martyr<MyResource> {
@@ -48,39 +48,66 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use parking_lot::RwLock;
 
 // ============================================================================
-// Sealed - 不泄露契约
+// NoLeakPledge - 不泄露承诺
 // ============================================================================
 
-/// 不泄露契约 — 承诺类型不会泄露自身内部的任何指针
+/// 不泄露承诺 — 宣誓类型不会泄露自身的内存布局
 ///
-/// # 契约内容
+/// # ⚠️ 警告：这是人工契约，编译器无法验证
 ///
-/// 实现此 trait 的类型必须遵守以下规则：
+/// **实现此 trait 前，您必须诚实回答以下问题：**
 ///
-/// 1. **无共享指针**：不持有 `Arc`、`Rc` 或任何可克隆的共享引用
-/// 2. **无内部泄露**：所有方法的返回值要么是值类型，要么生命周期绑定到 `&self`
-/// 3. **无裸指针暴露**：不提供获取内部裸指针的方法
+/// 1. 类型 T 是否有方法返回指向 **T 自身内存布局** 的指针或引用？
+/// 2. 这些指针/引用是否会逃逸到 `__invoke` 闭包外部？
+///
+/// **如果答案为"是"，则必须确保这些引用只在 `__invoke` 闭包内使用，
+/// 最终返回值必须是 owned 值或 `'static` 生命周期。**
+///
+/// # 契约语义（精确定义）
+///
+/// 被 `Martyr<T>` 包装的资源 T，其**自身内存布局**（T 类型的结构体实例）
+/// 必须只能通过 Martyr 访问。具体而言：
+///
+/// - **受保护的**：T 自身的内存布局（struct 的字段们占据的连续内存）
+/// - **不受限制的**：T 内部字段所指向的其他内存（如 T 持有的 Arc 指向的资源）
+///
+/// ## 理解示例
+///
+/// ```text
+/// struct Scheduler {
+///     id: u64,                    // ← 这8字节属于 Scheduler 的内存布局
+///     pool: Arc<ConnectionPool>,  // ← 这16字节(指针)属于 Scheduler 的内存布局
+///                                 //   但 ConnectionPool 本身在另一段内存，不受保护
+/// }
+/// ```
+///
+/// Martyr 保护的是 Scheduler 的 24 字节，不是 ConnectionPool 的内存。
+/// 所以 `pool.clone()` 返回 Arc 是合法的——它指向第三方内存。
 ///
 /// # 为什么不是 unsafe trait？
 ///
 /// 这是一个**君子协定**。编译器无法验证这些规则，实现者必须人工保证。
-/// 我们选择不使用 `unsafe` 是因为：违反契约不会导致内存安全问题（UB），
-/// 只会导致生命周期保护失效——这是逻辑错误，不是内存错误。
+/// 违反契约不会导致内存安全问题（UB），只会导致 Martyr 的生命周期保护失效
+/// ——这是逻辑错误，不是内存错误。
 ///
-/// # 示例
+/// # 合规示例
 ///
 /// ```
-/// use mmg_martyr::Sealed;
+/// use mmg_martyr::NoLeakPledge;
 ///
-/// struct SafeResource {
-///     data: Vec<u8>,      // ✅ 值语义
-///     count: i32,         // ✅ 值类型
-/// }
+/// // ✅ 纯值类型
+/// struct Counter { value: i32 }
+/// impl NoLeakPledge for Counter {}
 ///
-/// // SafeResource 不持有共享指针，不泄露内部引用
-/// impl Sealed for SafeResource {}
+/// // ✅ 原子类型
+/// struct AtomicState { flag: std::sync::atomic::AtomicBool }
+/// impl NoLeakPledge for AtomicState {}
+///
+/// // ✅ ZST（零大小类型）
+/// struct EmptyMarker;
+/// impl NoLeakPledge for EmptyMarker {}
 /// ```
-pub trait Sealed: Sized {}
+pub trait NoLeakPledge: Sized {}
 
 // ============================================================================
 // Martyr - 殉道者
@@ -105,10 +132,10 @@ pub struct Martyr<T> {
     visitor_count: AtomicIsize,
 }
 
-impl<T: Sealed> Martyr<T> {
+impl<T: NoLeakPledge> Martyr<T> {
     /// 创建殉道者，托管资源
     ///
-    /// 从此刻起，T 的指针只存在于 Martyr 内部。
+    /// 从此刻起，T 的内存布局只存在于 Martyr 内部。
     pub fn new(resource: T) -> Self {
         Self {
             inner: RwLock::new(Some(resource)),
@@ -152,10 +179,30 @@ impl<T: Sealed> Martyr<T> {
 
     /// 代理调用 — **仅限 impl Trait for Martyr<T> 使用**
     ///
-    /// # 为什么需要 HRTB
+    /// # ⚠️ 警告：危险的内部 API
+    ///
+    /// 双下划线前缀表示这是一个**需要理解契约才能使用**的方法。
+    ///
+    /// # HRTB 约束
     ///
     /// `for<'a> FnOnce(&'a T) -> R` 确保返回值 `R` 不依赖 `&T` 的生命周期。
-    /// 这从编译层面阻止了 `&T` 逃逸到闭包外部。
+    /// 这从编译层面阻止了 `&T` 或其内部引用逃逸到闭包外部。
+    ///
+    /// # 正确用法
+    ///
+    /// ```ignore
+    /// // ✅ 返回值类型（Copy 或 owned）
+    /// self.__invoke(|r| r.get_count())
+    ///
+    /// // ✅ 内部引用在闭包内消费，返回 owned 值
+    /// self.__invoke(|r| r.endpoint().to_string())
+    ///
+    /// // ✅ 返回 T 持有的外部 Arc 克隆（指向第三方内存）
+    /// self.__invoke(|r| r.connection_pool.clone())
+    ///
+    /// // ✅ 返回 'static Future（必须完全自包含）
+    /// self.__invoke(|r| r.create_request())  // 返回 BoxFuture<'static, ...>
+    /// ```
     #[doc(hidden)]
     pub fn __invoke<F, R>(&self, f: F) -> Result<R, MartyrError>
     where
@@ -181,6 +228,8 @@ impl<T: Sealed> Martyr<T> {
     }
 
     /// 可变代理调用 — **仅限 impl Trait for Martyr<T> 使用**
+    ///
+    /// 参见 `__invoke` 的文档说明。
     #[doc(hidden)]
     pub fn __invoke_mut<F, R>(&self, f: F) -> Result<R, MartyrError>
     where
@@ -260,8 +309,7 @@ mod tests {
         value: i32,
     }
 
-    // Counter 是纯值类型，遵守契约
-    impl Sealed for Counter {}
+    impl NoLeakPledge for Counter {}
 
     impl Counter {
         fn new(value: i32) -> Self {
