@@ -1,209 +1,348 @@
-//! # Martyr - 主权内存模型
+//! # Martyr - 殉道者
 //!
-//! 通过编译期生命周期禁锢实现零泄露资源管理。
+//! 资源的唯一守护者。
 //!
-//! ## 安全保证
+//! ## 殉道者的誓言
 //!
-//! - **引用不可逃逸**：HRTB (`for<'a>`) 确保闭包返回值不能携带资源引用
-//! - **访客审计**：运行时计数 + 殉道检查确保无滞留访客
-//! - **单点主权**：`Sovereign` 是唯一强所有者，`Lease` 仅为弱观察者
+//! > "我可以被无数人指向，但绝不泄露我誓死保卫的资源。"
+//!
+//! ## 核心原则
+//!
+//! - **唯一指针**：系统中只有 Martyr 持有指向资源 T 的指针
+//! - **代理访问**：外部通过为 `Martyr<T>` 实现的 trait 代理操作，永远无法获得 `&T`
+//! - **壳可共享**：Martyr 可以被 `Arc` 包裹共享，因为共享的只是"壳"
+//! - **资源不泄露**：T 的指针物理上只存在一份，kill 时必死无疑
+//!
+//! ## 双层防护
+//!
+//! ```text
+//! 外层（Martyr 负责）：HRTB 约束，防止 &T 逃逸
+//! 内层（Sealed 契约）：T 承诺不持有可泄露的共享指针
+//! ```
+//!
+//! ## 使用方式
+//!
+//! ```ignore
+//! use mmg_martyr::{Martyr, Sealed};
+//!
+//! struct MyResource { /* ... */ }
+//!
+//! // 1. 声明遵守契约
+//! impl Sealed for MyResource {}
+//!
+//! // 2. 为 Martyr<T> 实现 trait
+//! impl MyTrait for Martyr<MyResource> {
+//!     fn operation(&self) -> i32 {
+//!         self.__invoke(|r| r.compute()).unwrap_or(0)
+//!     }
+//! }
+//!
+//! // 3. 使用
+//! let martyr = Martyr::new(my_resource);
+//! martyr.operation();
+//! martyr.kill();
+//! ```
+
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
 use parking_lot::RwLock;
-use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
-use std::sync::{Arc, Weak};
 
-/// Discipline defines how to handle violations (e.g., accessing a killed resource).
-pub trait Discipline: Send + Sync + 'static {
-    fn punish(action: &'static str) -> !;
-}
+// ============================================================================
+// Sealed - 不泄露契约
+// ============================================================================
 
-/// Default discipline: Panic.
-pub struct PanicDiscipline;
+/// 不泄露契约 — 承诺类型不会泄露自身内部的任何指针
+///
+/// # 契约内容
+///
+/// 实现此 trait 的类型必须遵守以下规则：
+///
+/// 1. **无共享指针**：不持有 `Arc`、`Rc` 或任何可克隆的共享引用
+/// 2. **无内部泄露**：所有方法的返回值要么是值类型，要么生命周期绑定到 `&self`
+/// 3. **无裸指针暴露**：不提供获取内部裸指针的方法
+///
+/// # 为什么不是 unsafe trait？
+///
+/// 这是一个**君子协定**。编译器无法验证这些规则，实现者必须人工保证。
+/// 我们选择不使用 `unsafe` 是因为：违反契约不会导致内存安全问题（UB），
+/// 只会导致生命周期保护失效——这是逻辑错误，不是内存错误。
+///
+/// # 示例
+///
+/// ```
+/// use mmg_martyr::Sealed;
+///
+/// struct SafeResource {
+///     data: Vec<u8>,      // ✅ 值语义
+///     count: i32,         // ✅ 值类型
+/// }
+///
+/// // SafeResource 不持有共享指针，不泄露内部引用
+/// impl Sealed for SafeResource {}
+/// ```
+pub trait Sealed: Sized {}
 
-impl Discipline for PanicDiscipline {
-    fn punish(action: &'static str) -> ! {
-        panic!("🔥 [Martyr] Sovereign violation! Action: {}", action);
-    }
-}
+// ============================================================================
+// Martyr - 殉道者
+// ============================================================================
 
-/// Internal status of a resource.
-struct ResourceStatus {
-    visitor_count: AtomicIsize,
+/// 殉道者 — 资源的唯一守护者
+///
+/// # 内存布局
+///
+/// ```text
+/// Martyr<T>
+/// ├── inner: RwLock<Option<T>>  ← T 被 RwLock 保护
+/// ├── is_killed: AtomicBool     ← 死亡标记
+/// └── visitor_count: AtomicIsize ← 访客计数
+/// ```
+pub struct Martyr<T> {
+    /// 被保护的资源 — 通过 RwLock 保护，无需 unsafe
+    inner: RwLock<Option<T>>,
+    /// 死亡标记
     is_killed: AtomicBool,
+    /// 访客计数（调试用）
+    visitor_count: AtomicIsize,
 }
 
-/// The cell holding the resource and its status.
-struct SovereignCell<T> {
-    instance: T,
-    status: ResourceStatus,
-}
-
-/// The Sovereign container. Manages the lifecycle of a single resource `T`.
-/// It holds the strong ownership of the resource.
-///
-/// # 注意
-///
-/// 必须持有此值直到资源不再需要。丢弃 `Sovereign` 会触发殉道审计。
-#[must_use = "Sovereign 被丢弃会立即触发资源销毁和殉道审计，请确保持有它直到资源不再需要"]
-pub struct Sovereign<T, D: Discipline = PanicDiscipline> {
-    // We use RwLock<Option<Arc>> to allow "taking" the resource out (killing it)
-    // while the Sovereign struct itself remains valid (but empty).
-    // This is crucial for explicit kill operations.
-    inner: RwLock<Option<Arc<SovereignCell<T>>>>,
-    _marker: PhantomData<D>,
-}
-
-impl<T, D: Discipline> Sovereign<T, D> {
-    /// Create a new Sovereign container protecting the given resource.
-    /// Returns the Sovereign (Owner) and a Lease (Weak Handle).
-    pub fn new(resource: T) -> (Self, Lease<T, D>) {
-        let cell = Arc::new(SovereignCell {
-            instance: resource,
-            status: ResourceStatus {
-                visitor_count: AtomicIsize::new(0),
-                is_killed: AtomicBool::new(false),
-            },
-        });
-
-        let lease = Lease {
-            cell: Arc::downgrade(&cell),
-            _marker: PhantomData,
-        };
-
-        let sovereign = Self {
-            inner: RwLock::new(Some(cell)),
-            _marker: PhantomData,
-        };
-
-        (sovereign, lease)
+impl<T: Sealed> Martyr<T> {
+    /// 创建殉道者，托管资源
+    ///
+    /// 从此刻起，T 的指针只存在于 Martyr 内部。
+    pub fn new(resource: T) -> Self {
+        Self {
+            inner: RwLock::new(Some(resource)),
+            is_killed: AtomicBool::new(false),
+            visitor_count: AtomicIsize::new(0),
+        }
     }
 
-    /// Issue a new Lease to this Sovereign's resource.
+    /// 杀死资源（非协商式）
     ///
-    /// # Safety (Logical)
+    /// # Panics
     ///
-    /// This is safe because:
-    /// - Lease only holds a Weak reference (cannot extend lifetime)
-    /// - Lease cannot upgrade to strong reference (by design)
-    /// - Multiple Leases coexist safely
-    ///
-    /// # Returns
-    ///
-    /// - `Some(Lease)` if the resource is still alive
-    /// - `None` if the resource has been killed
-    pub fn issue_lease(&self) -> Option<Lease<T, D>> {
-        let lock = self.inner.read();
-        lock.as_ref().map(|cell| Lease {
-            cell: Arc::downgrade(cell),
-            _marker: PhantomData,
-        })
-    }
-
-    /// Kill the resource immediately.
-    /// This will:
-    /// 1. Mark the resource as killed (preventing new visitors).
-    /// 2. Check for active visitors (panic if any).
-    /// 3. Drop the strong reference to the resource (physically releasing it if no visitors).
+    /// 当有访客正在访问时，触发殉葬（panic）。
     pub fn kill(&self) {
-        let mut lock = self.inner.write();
-        if let Some(cell) = lock.take() {
-            // 1. Signal Kill
-            cell.status.is_killed.store(true, Ordering::SeqCst);
+        // 获取写锁
+        let mut guard = self.inner.write();
 
-            // 2. Check for lingering visitors
-            let visitors = cell.status.visitor_count.load(Ordering::SeqCst);
-            if visitors > 0 {
-                panic!("💥 [Martyr] Force kill executed! {} visitors lingering. System self-destruct.", visitors);
-            }
+        // 标记死亡
+        self.is_killed.store(true, Ordering::SeqCst);
 
-            // 3. Drop Arc (happens when `cell` goes out of scope here)
+        // 检查访客
+        let visitors = self.visitor_count.load(Ordering::SeqCst);
+        if visitors > 0 {
+            panic!(
+                "💀 [Martyr] {} visitors still accessing! Martyrdom triggered.",
+                visitors
+            );
+        }
+
+        // 销毁资源
+        if guard.take().is_some() {
             tracing::debug!("✅ [Martyr] Resource killed cleanly.");
         }
     }
-}
 
-impl<T, D: Discipline> Drop for Sovereign<T, D> {
-    fn drop(&mut self) {
-        // Ensure we kill properly on drop
-        self.kill();
+    /// 资源是否还活着
+    #[inline]
+    pub fn is_alive(&self) -> bool {
+        !self.is_killed.load(Ordering::SeqCst)
     }
-}
 
-/// A Lease is a safe handle to a sovereign resource.
-/// It does not own the resource, but allows controlled access.
-pub struct Lease<T, D: Discipline = PanicDiscipline> {
-    cell: Weak<SovereignCell<T>>,
-    _marker: PhantomData<D>,
-}
-
-impl<T, D: Discipline> Clone for Lease<T, D> {
-    fn clone(&self) -> Self {
-        Self {
-            cell: self.cell.clone(),
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<T, D: Discipline> Lease<T, D> {
-    /// 安全访问受保护资源。
+    /// 代理调用 — **仅限 impl Trait for Martyr<T> 使用**
     ///
-    /// 闭包 `f` 在哨兵上下文中执行，资源引用 `&T` **不可能**逃逸出闭包。
+    /// # 为什么需要 HRTB
     ///
-    /// # 编译期安全保证
-    ///
-    /// 通过 `for<'a>` (HRTB) 约束，返回值 `R` 必须独立于资源的生命周期。
-    /// 任何尝试返回资源引用的代码都会在**编译期**被拒绝：
-    ///
-    /// ```compile_fail
-    /// # use mmg_martyr::{Sovereign, Lease};
-    /// # let (sovereign, lease) = Sovereign::<String>::new("data".into());
-    /// // 编译错误：返回值生命周期依赖闭包参数
-    /// let escaped: &str = lease.access("steal", |s| s.as_str()).unwrap();
-    /// ```
-    pub fn access<F, R>(&self, action: &'static str, f: F) -> Result<R, AccessError>
+    /// `for<'a> FnOnce(&'a T) -> R` 确保返回值 `R` 不依赖 `&T` 的生命周期。
+    /// 这从编译层面阻止了 `&T` 逃逸到闭包外部。
+    #[doc(hidden)]
+    pub fn __invoke<F, R>(&self, f: F) -> Result<R, MartyrError>
     where
         F: for<'a> FnOnce(&'a T) -> R,
     {
-        // 1. Upgrade Weak to Arc. If fails, resource is gone.
-        let cell = self.cell.upgrade().ok_or(AccessError::ResourceNotFound { resource: action })?;
-
-        // 2. Check-in
-        cell.status.visitor_count.fetch_add(1, Ordering::SeqCst);
-        
-        // RAII guard for Check-out
-        let _guard = VisitorGuard {
-            status: &cell.status,
-        };
-
-        // 3. Check if killed (Before execution)
-        if cell.status.is_killed.load(Ordering::SeqCst) {
-            D::punish(action);
+        // 检查是否已死
+        if self.is_killed.load(Ordering::SeqCst) {
+            return Err(MartyrError::ResourceKilled);
         }
 
-        // 4. Execute
-        let result = f(&cell.instance);
+        // 获取读锁
+        let guard = self.inner.read();
 
-        Ok(result)
+        // 访客登记
+        self.visitor_count.fetch_add(1, Ordering::SeqCst);
+        let _visitor = VisitorGuard {
+            count: &self.visitor_count,
+        };
+
+        // 执行操作
+        let resource = guard.as_ref().ok_or(MartyrError::ResourceKilled)?;
+        Ok(f(resource))
+    }
+
+    /// 可变代理调用 — **仅限 impl Trait for Martyr<T> 使用**
+    #[doc(hidden)]
+    pub fn __invoke_mut<F, R>(&self, f: F) -> Result<R, MartyrError>
+    where
+        F: for<'a> FnOnce(&'a mut T) -> R,
+    {
+        // 检查是否已死
+        if self.is_killed.load(Ordering::SeqCst) {
+            return Err(MartyrError::ResourceKilled);
+        }
+
+        // 获取写锁
+        let mut guard = self.inner.write();
+
+        // 访客登记
+        self.visitor_count.fetch_add(1, Ordering::SeqCst);
+        let _visitor = VisitorGuard {
+            count: &self.visitor_count,
+        };
+
+        // 执行操作
+        let resource = guard.as_mut().ok_or(MartyrError::ResourceKilled)?;
+        Ok(f(resource))
     }
 }
+
+impl<T> Drop for Martyr<T> {
+    fn drop(&mut self) {
+        if !self.is_killed.load(Ordering::SeqCst) {
+            self.is_killed.store(true, Ordering::SeqCst);
+            let visitors = self.visitor_count.load(Ordering::SeqCst);
+            if visitors > 0 {
+                panic!(
+                    "💀 [Martyr] Dropped with {} visitors! Martyrdom triggered.",
+                    visitors
+                );
+            }
+        }
+    }
+}
+
+// ============================================================================
+// VisitorGuard - RAII 访客守卫
+// ============================================================================
 
 struct VisitorGuard<'a> {
-    status: &'a ResourceStatus,
+    count: &'a AtomicIsize,
 }
 
-impl<'a> Drop for VisitorGuard<'a> {
+impl Drop for VisitorGuard<'_> {
     fn drop(&mut self) {
-        self.status.visitor_count.fetch_sub(1, Ordering::SeqCst);
+        self.count.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-#[derive(thiserror::Error, Debug)]
-pub enum AccessError {
-    #[error("resource '{resource}' not found or already released")]
-    ResourceNotFound {
-        /// 尝试访问的资源名称
-        resource: &'static str,
-    },
+// ============================================================================
+// MartyrError - 错误类型
+// ============================================================================
+
+/// Martyr 错误
+#[derive(Debug, thiserror::Error)]
+pub enum MartyrError {
+    /// 资源已被杀死
+    #[error("resource has been killed")]
+    ResourceKilled,
+}
+
+// ============================================================================
+// 测试
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    struct Counter {
+        value: i32,
+    }
+
+    // Counter 是纯值类型，遵守契约
+    impl Sealed for Counter {}
+
+    impl Counter {
+        fn new(value: i32) -> Self {
+            Self { value }
+        }
+
+        fn get(&self) -> i32 {
+            self.value
+        }
+
+        fn increment(&mut self) {
+            self.value += 1;
+        }
+    }
+
+    trait CounterOps {
+        fn get_value(&self) -> i32;
+        fn inc(&self);
+    }
+
+    impl CounterOps for Martyr<Counter> {
+        fn get_value(&self) -> i32 {
+            self.__invoke(|c| c.get()).unwrap_or(0)
+        }
+
+        fn inc(&self) {
+            let _ = self.__invoke_mut(|c| c.increment());
+        }
+    }
+
+    #[test]
+    fn test_basic_proxy() {
+        let martyr = Martyr::new(Counter::new(42));
+        assert_eq!(martyr.get_value(), 42);
+        martyr.inc();
+        assert_eq!(martyr.get_value(), 43);
+    }
+
+    #[test]
+    fn test_kill() {
+        let martyr = Martyr::new(Counter::new(42));
+        assert!(martyr.is_alive());
+        martyr.kill();
+        assert!(!martyr.is_alive());
+        assert_eq!(martyr.get_value(), 0);
+    }
+
+    #[test]
+    fn test_arc_sharing() {
+        let martyr = Arc::new(Martyr::new(Counter::new(42)));
+        let martyr2 = Arc::clone(&martyr);
+
+        assert_eq!(martyr.get_value(), 42);
+        assert_eq!(martyr2.get_value(), 42);
+
+        martyr2.kill();
+
+        assert!(!martyr.is_alive());
+        assert!(!martyr2.is_alive());
+    }
+
+    #[test]
+    fn test_concurrent_access() {
+        use std::thread;
+
+        let martyr = Arc::new(Martyr::new(Counter::new(0)));
+        let mut handles = vec![];
+
+        for _ in 0..10 {
+            let m = Arc::clone(&martyr);
+            handles.push(thread::spawn(move || {
+                for _ in 0..100 {
+                    m.inc();
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(martyr.get_value(), 1000);
+    }
 }

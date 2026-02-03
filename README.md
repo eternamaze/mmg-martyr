@@ -1,86 +1,176 @@
-# Martyr (殉道者)
+# Martyr - 殉道者
 
-**主权临界区与生命周期禁锢协议 (Sovereign Critical Section & Lifetime Confinement Protocol)**
+> **殉道者的誓言**：我可以被无数人指向，但绝不泄露我誓死保卫的资源。
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+## 哲学
 
-> “只要你还在触碰资源，我就能找到你并终结你；只要你离开了，你就再也无法触碰它。”
+传统智能指针（如 `Arc<T>`）的问题：**指针可以无限复制**。任何持有者都可以"拒绝释放"，生命周期由所有持有者的联合意志决定。
 
-## 核心理念 / Philosophy
+Martyr 的哲学：
 
-Martyr 是一个为高可靠性系统（如金融交易核心）设计的 Rust 库，旨在终结“所有权模糊”的时代。它通过强制性的**资源禁锢 (Resource Confinement)** 和 **双向哨兵 (Bi-directional Sentry)** 机制，确保资源生命周期的绝对确定性。
+| 概念 | Arc | Martyr |
+|------|-----|--------|
+| 资源指针 | 多份（每个 Arc 一份） | **唯一一份**（只在 Martyr 内部） |
+| 生命周期控制 | 民主制（最后一个放手才释放） | 独裁制（kill 时必死） |
+| 共享的是什么 | 资源本身的指针 | **容器的壳**（Arc<Martyr<T>>） |
 
-在 Martyr 的世界里：
-*   **资源不属于使用者**：资源被“禁锢”在主权临界区内。
-*   **访问即签署生死状**：进入临界区意味着接受主权中心的审计与潜在的“处决”。
-*   **生命周期零泄露**：利用 Rust 的高阶闭包 (HRTB) 确保引用无法逃逸。
+```
+Arc<T>（民主制）：          Martyr<T>（独裁制）：
 
-## 核心特性 / Features
+  A ─→ Arc ──┐                A ─→ Arc ──┐
+             ├──→ T                       ├──→ Martyr ──→ T
+  B ─→ Arc ──┘                B ─→ Arc ──┘
+                                          ↑
+  任何持有者都能                    唯一指向 T 的指针
+  阻止 T 的释放                    kill 时 T 必死
+```
 
-*   **🔒 资源禁锢 (Resource Confinement)**
-    利用 `for<'b> F: FnOnce(&'b T) -> R` 匿名生命周期，物理上杜绝资源引用逃逸出闭包的可能性。
+## 双层防护
 
-*   **👮 双向哨兵 (Bi-directional Sentry)**
-    全生命周期的实名审计。
-    *   **Check-in**: 记录访问者，签署“处决契约”。
-    *   **Check-out**: 基于 RAII 自动注销，证明“清白”。
+**外层（Martyr 负责）**：
+- HRTB 约束（`for<'a> FnOnce(&'a T) -> R`）确保 `&T` 无法逃逸
+- 代理模式：外部只能通过 trait 方法操作，永远不直接获得 `&T`
 
-*   **⚡ 主权处决 (Sovereign Execution)**
-    当主权中心发起 `force_kill` 时：
-    *   **瞬时熔断**：拒绝一切新的访问。
-    *   **存量审计**：检测是否有滞留者。
-    *   **同步殉葬**：若发现滞留者，直接触发 Panic (或自定义纪律)，宁可崩溃也不允许未定义的资源状态存在。
+**内层（Sealed 契约）**：
+- T 必须实现 `Sealed` trait，承诺不持有可泄露的共享指针
+- 这是君子协定——编译器无法验证，实现者人工保证
 
-## 快速开始 / Quick Start
+为什么需要两层？因为 HRTB 只能阻止 `&T` 直接逃逸。如果 T 内部持有 `Arc<Something>`，闭包仍可以 `Arc::clone()` 逃逸。
+
+## 使用
 
 ```rust
-use mmg_martyr::{SovereignRegistry, PanicDiscipline};
+use mmg_martyr::{Martyr, Sealed, MartyrError};
 
-struct DatabaseConnection {
-    id: u32,
+// 1. 定义资源
+struct Database {
+    data: Vec<String>,
 }
 
+// 2. 声明遵守契约（无共享指针、无内部泄露）
+impl Sealed for Database {}
+
+// 3. 定义接口 trait
+trait DatabaseOps {
+    fn query(&self, id: usize) -> Option<String>;
+    fn insert(&self, value: String);
+}
+
+// 4. 为 Martyr<T> 实现 trait（不是为 T）
+impl DatabaseOps for Martyr<Database> {
+    fn query(&self, id: usize) -> Option<String> {
+        self.__invoke(|db| db.data.get(id).cloned())
+            .ok()
+            .flatten()
+    }
+    
+    fn insert(&self, value: String) {
+        let _ = self.__invoke_mut(|db| db.data.push(value));
+    }
+}
+
+// 5. 使用
 fn main() {
-    // 1. 建立主权中心
-    let registry = SovereignRegistry::<DatabaseConnection, PanicDiscipline>::new();
-
-    // 2. 注册资源，移交所有权，换取唯一的 Key
-    let db_conn = DatabaseConnection { id: 1001 };
-    let key = registry.register(db_conn);
-
-    // 3. 安全访问
-    registry.access(key, |sentry| {
-        // 此时你持有哨兵，但还未接触到资源
-        
-        // 4. 申请进入临界区
-        sentry.execute("query_user", |conn| {
-            println!("正在使用数据库连接: {}", conn.id);
-            // 引用 conn 被禁锢在此闭包内，无法被带出
-        });
-    });
-
-    // 5. 主权处决
-    // 强制销毁资源。如果此时仍有线程滞留在 execute 闭包内，系统将 Panic。
-    registry.force_kill(key);
+    let db = Martyr::new(Database { data: vec![] });
+    
+    db.insert("hello".to_string());
+    assert_eq!(db.query(0), Some("hello".to_string()));
+    
+    db.kill();  // 资源立即销毁
+    assert_eq!(db.query(0), None);  // 已死
 }
 ```
 
-## 架构设计 / Architecture
+### Arc 共享
 
-### 1. 权力根基：资源禁锢
-开发者永远无法接触资源的真实句柄，只能接触到被哨兵严格监控的“镜像借用”。离开哨兵大门的那一刻，访客在物理上**不可能**持有任何关于资源的残留信息。
+```rust
+use std::sync::Arc;
 
-### 2. 最终审判：清场与殉葬
-当 `force_kill` 发生时：
-1.  **关灯**：原子开关翻转。
-2.  **清点**：检查 `visitor_count`。
-3.  **处决**：
-    *   **名单为空** -> 安全物理析构。
-    *   **名单不为空** -> 触发 `Discipline::punish` (默认 Panic)。
+let shared = Arc::new(Martyr::new(Database { data: vec![] }));
+let holder1 = Arc::clone(&shared);
+let holder2 = Arc::clone(&shared);
 
-## 许可证 / License
+// 共享的是 Martyr（壳），不是 Database（资源）
+// Database 的指针始终只有一份
+```
 
-本项目采用 [MIT License](LICENSE) 开源。
+## API
 
----
-*Built for those who demand absolute certainty.*
+```rust
+// 契约标记
+pub trait Sealed: Sized {}
+
+// 殉道者
+pub struct Martyr<T> { /* ... */ }
+
+impl<T: Sealed> Martyr<T> {
+    pub fn new(resource: T) -> Self;
+    pub fn is_alive(&self) -> bool;
+    pub fn kill(&self);  // panic if visitors present
+    
+    // 仅供 trait 实现使用
+    #[doc(hidden)]
+    pub fn __invoke<F, R>(&self, f: F) -> Result<R, MartyrError>
+    where F: for<'a> FnOnce(&'a T) -> R;
+    
+    #[doc(hidden)]
+    pub fn __invoke_mut<F, R>(&self, f: F) -> Result<R, MartyrError>
+    where F: for<'a> FnOnce(&'a mut T) -> R;
+}
+
+pub enum MartyrError {
+    ResourceKilled,
+}
+```
+
+## Sealed 契约
+
+实现 `Sealed` 意味着承诺：
+
+1. **无共享指针**：不持有 `Arc`、`Rc`
+2. **无内部泄露**：方法返回值是值类型，或生命周期绑定到 `&self`
+3. **无裸指针暴露**：不提供获取内部裸指针的方法
+
+```rust
+// ✅ 正确
+struct Safe { data: Vec<u8>, count: i32 }
+impl Sealed for Safe {}
+
+// ❌ 违反契约
+struct Leaky { shared: Arc<Data> }
+impl Sealed for Leaky {}  // 危险！Arc 可被克隆逃逸
+```
+
+## 威胁模型
+
+| 威胁 | 状态 | 机制 |
+|------|------|------|
+| `&T` 直接逃逸 | ✅ 阻止 | HRTB 约束 |
+| T 内部 Arc 逃逸 | ⚠️ 契约 | Sealed 君子协定 |
+| 访问已销毁资源 | ✅ 阻止 | MartyrError |
+| 并发竞争 | ✅ 阻止 | RwLock |
+| 硬件指针复制 | ❌ 不可能 | 冯·诺依曼架构限制 |
+
+## 为什么叫"殉道者"？
+
+殉道者为信仰献身：
+- 殉道者誓死保护其内部的"道"（资源）
+- 殉道者可以被无数人"指向"（引用）
+- 但殉道者绝不泄露其保护的"道"的位置
+- 当殉道者决定"殉道"（kill）时，资源立即消亡——只要它不背叛
+
+## 关于图灵完备与安全性
+
+用户问：为什么图灵完备的系统不能保证"不泄露"？
+
+图灵完备描述**计算能力**（能算出什么结果），不描述**约束能力**（能阻止什么行为）。
+
+你想要的"引用图入边约束"是数学上良定义的静态性质，但图灵机是关于动态计算的。这是两个正交的维度。类型系统、借用检查器等都是在图灵完备之上**额外添加的约束层**。
+
+硬件层面（x86/ARM）无法实现"只允许特定位置的指针解引用到特定内存"——CPU 解引用时只看指针的值（一个数字），不追踪这个数字是从哪里加载的。这是冯·诺依曼架构的本质限制。
+
+因此，Martyr 是在软件层面能做到的"尽力而为"。
+
+## License
+
+MIT
