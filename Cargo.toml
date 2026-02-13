@@ -2,6 +2,11 @@
 name = "mmg-martyr"
 version = "0.1.0"
 edition = "2024"
+description = "Single-pointer revocable capability guard. One edge in, one kill to sever it."
+license = "MIT"
+repository = "https://github.com/MMG-Unitrade/mmg-martyr"
+keywords = ["capability", "resource-guard", "unique-pointer", "concurrency"]
+categories = ["concurrency", "memory-management"]
 
 [dependencies]
 parking_lot = "0.12.5"
