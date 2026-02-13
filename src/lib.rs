@@ -1,88 +1,117 @@
-//! # Martyr — 唯一指针守卫
+//! # Martyr — 唯一边守卫
 //!
-//! 基于图论的资源保护：资源 T 在内存中只有一条入边（一个指针），
-//! 由 Martyr 独占持有。外部通过 HRTB 约束的闭包代理访问，
-//! 永远无法获得指向 T 的直接指针。
+//! 令 $G = (V, E)$ 为堆内存有向图，资源 T 占据子图 $S \subseteq G$。
 //!
-//! ## 图论模型
+//! **不变量**：从 S 外部进入 S 的边恰好有一条 — Martyr 内的 `*mut T`。
 //!
 //! ```text
-//! Arc ──→ Arc ──→ Martyr ──唯一边──→ T
-//! Arc ──↗          ↑
-//!              (多条入边指向壳)
+//! Martyr ──*mut T──→ [ T ──→ T.field ──→ ... ]
+//!          ↑          └──────── S ────────────┘
+//!       唯一边
 //! ```
 //!
-//! - Martyr 到 T 的边是**唯一的**（`RwLock<Option<T>>`）
-//! - Martyr 自身可被 `Arc` 共享（壳有多条入边）
-//! - `kill()` = 切断唯一边 → T 不可达 → T 被销毁
-//! - `invoke()` = 通过唯一边代理访问（HRTB 防止引用逃逸）
+//! 切断唯一边 → S 成为孤立子图 → `Box::from_raw` 回收。
 //!
-//! 只要没有第二个直接指针，图论保证资源不泄露。
+//! ## 安全性
+//!
+//! | 威胁 | 防御 |
+//! |------|------|
+//! | 引用逃逸 | HRTB `for<'a>` — 闭包无法捕获内部引用 |
+//! | 并发竞争 | `RwLock` 读写互斥 |
+//! | 悬垂指针 | `kill()` 先置空再释放 |
+//! | 子图泄露 | T 的设计契约（计算理论边界） |
 
 use parking_lot::RwLock;
+use std::ptr;
 
-/// 唯一边已被切断，资源不可达。
+/// 唯一边已被切断。资源子图不可达。
 #[derive(Debug, PartialEq, thiserror::Error)]
 #[error("resource killed")]
 pub struct ResourceKilled;
 
-/// 唯一指针守卫。
+/// 唯一边守卫。
 ///
-/// `Martyr(T) = RwLock(Option(T))`
-///
-/// - `Some(T)` = 唯一边存在，资源可达
-/// - `None` = 唯一边已切断，资源已销毁
-/// - `RwLock` = 并发安全的读写互斥
-/// - HRTB 约束 = 闭包无法将 `&T` 逃逸到外部
+/// `RwLock<*mut T>`：锁保护的就是唯一边本身。
+/// 非空 = 边存在 = 资源可达。空 = 边已切断 = 资源已回收。
 pub struct Martyr<T> {
-    resource: RwLock<Option<T>>,
+    edge: RwLock<*mut T>,
 }
 
+// SAFETY: Martyr 独占堆上的 T。T: Send — kill() 可在任意线程回收。
+unsafe impl<T: Send> Send for Martyr<T> {}
+// SAFETY: invoke() 并发时多线程共享 &T。T: Sync — &T 跨线程安全。
+unsafe impl<T: Send + Sync> Sync for Martyr<T> {}
+
 impl<T> Martyr<T> {
-    /// 建立从 Martyr 到 T 的唯一边。
+    /// 将 T 移入堆，建立唯一边。
+    ///
+    /// `Box::into_raw(Box::new(resource))` 创建系统中唯一的 `*mut T`。
     pub fn new(resource: T) -> Self {
         Self {
-            resource: RwLock::new(Some(resource)),
+            edge: RwLock::new(Box::into_raw(Box::new(resource))),
         }
     }
 
-    /// 切断唯一边。T 不可达，立即销毁。
+    /// 切断唯一边。T 的子图成为孤立分量，立即回收。
     ///
-    /// 返回 `true` 表示本次切断成功，`false` 表示边已不存在。
+    /// 先置空再释放（若 `T::drop` 恐慌，边已断，不会双重释放）。
     pub fn kill(&self) -> bool {
-        self.resource.write().take().is_some()
+        let mut edge = self.edge.write();
+        let ptr = *edge;
+        if ptr.is_null() {
+            return false;
+        }
+        *edge = ptr::null_mut();
+        // SAFETY: ptr 来自 Box::into_raw，非空。写锁保证独占。
+        unsafe { drop(Box::from_raw(ptr)) };
+        true
     }
 
-    /// 唯一边是否仍然存在。
+    /// 边是否存在。
     pub fn is_alive(&self) -> bool {
-        self.resource.read().is_some()
+        !self.edge.read().is_null()
     }
 
-    /// 通过唯一边代理读访问。
+    /// 通过唯一边共享访问。读锁允许并发。
     ///
-    /// HRTB 约束 `for<'a> FnOnce(&'a T) -> R` 确保 `&T` 无法逃逸。
+    /// HRTB `for<'a> FnOnce(&'a T) -> R` 确保 `&T` 无法逃逸。
     pub fn invoke<F, R>(&self, f: F) -> Result<R, ResourceKilled>
     where
         F: for<'a> FnOnce(&'a T) -> R,
     {
-        let guard = self.resource.read();
-        match guard.as_ref() {
-            Some(resource) => Ok(f(resource)),
-            None => Err(ResourceKilled),
+        let edge = self.edge.read();
+        let ptr = *edge;
+        if ptr.is_null() {
+            return Err(ResourceKilled);
         }
+        // SAFETY: ptr 非空，读锁阻止并发 kill/invoke_mut。
+        Ok(f(unsafe { &*ptr }))
     }
 
-    /// 通过唯一边代理写访问。
+    /// 通过唯一边独占访问。写锁保证互斥。
     ///
-    /// HRTB 约束 `for<'a> FnOnce(&'a mut T) -> R` 确保 `&mut T` 无法逃逸。
+    /// HRTB `for<'a> FnOnce(&'a mut T) -> R` 确保 `&mut T` 无法逃逸。
     pub fn invoke_mut<F, R>(&self, f: F) -> Result<R, ResourceKilled>
     where
         F: for<'a> FnOnce(&'a mut T) -> R,
     {
-        let mut guard = self.resource.write();
-        match guard.as_mut() {
-            Some(resource) => Ok(f(resource)),
-            None => Err(ResourceKilled),
+        let edge = self.edge.write();
+        let ptr = *edge;
+        if ptr.is_null() {
+            return Err(ResourceKilled);
+        }
+        // SAFETY: ptr 非空，写锁保证独占。
+        Ok(f(unsafe { &mut *ptr }))
+    }
+}
+
+impl<T> Drop for Martyr<T> {
+    fn drop(&mut self) {
+        // &mut self → 无其他引用 → get_mut 无需加锁
+        let ptr = *self.edge.get_mut();
+        if !ptr.is_null() {
+            // SAFETY: ptr 来自 Box::into_raw，非空。
+            unsafe { drop(Box::from_raw(ptr)) };
         }
     }
 }
@@ -123,7 +152,6 @@ mod tests {
         assert!(m.kill());
         assert!(!m.is_alive());
         assert!(m.invoke(|c| c.get()).is_err());
-        // Second kill returns false (already dead)
         assert!(!m.kill());
     }
 
@@ -131,10 +159,8 @@ mod tests {
     fn arc_sharing_single_edge() {
         let m = Arc::new(Martyr::new(Counter(42)));
         let m2 = Arc::clone(&m);
-        // Multiple paths to shell, but only one edge to resource
         assert_eq!(m.invoke(|c| c.get()), Ok(42));
         assert_eq!(m2.invoke(|c| c.get()), Ok(42));
-        // Any holder can sever the edge
         m.kill();
         assert!(!m2.is_alive());
         assert!(m2.invoke(|c| c.get()).is_err());
@@ -156,5 +182,31 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(m.invoke(|c| c.get()), Ok(1000));
+    }
+
+    /// 验证 kill 确实回收资源（T::drop 被调用）。
+    #[test]
+    fn kill_reclaims_resource() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static DROPPED: AtomicBool = AtomicBool::new(false);
+        struct Probe;
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                DROPPED.store(true, Ordering::Relaxed);
+            }
+        }
+        DROPPED.store(false, Ordering::Relaxed);
+        let m = Martyr::new(Probe);
+        assert!(!DROPPED.load(Ordering::Relaxed));
+        m.kill();
+        assert!(DROPPED.load(Ordering::Relaxed));
+    }
+
+    /// 验证 kill 后 drop 不会双重释放。
+    #[test]
+    fn drop_after_kill_is_noop() {
+        let m = Martyr::new(Counter(42));
+        m.kill();
+        drop(m); // 若双重释放则 UB/崩溃
     }
 }
