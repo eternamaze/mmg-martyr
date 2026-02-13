@@ -1,396 +1,160 @@
-//! # Martyr - 殉道者
+//! # Martyr — 唯一指针守卫
 //!
-//! 资源的唯一守护者。
+//! 基于图论的资源保护：资源 T 在内存中只有一条入边（一个指针），
+//! 由 Martyr 独占持有。外部通过 HRTB 约束的闭包代理访问，
+//! 永远无法获得指向 T 的直接指针。
 //!
-//! ## 殉道者的誓言
-//!
-//! > "我可以被无数人指向，但绝不泄露我誓死保卫的资源。"
-//!
-//! ## 核心原则
-//!
-//! - **唯一指针**：系统中只有 Martyr 持有指向资源 T 内存布局的指针
-//! - **代理访问**：外部通过 `__invoke` 代理操作，永远无法获得指向 T 的指针
-//! - **壳可共享**：Martyr 可以被 `Arc` 包裹共享，因为共享的只是"壳"
-//! - **资源不泄露**：T 的内存布局物理上只有 Martyr 一个入口，kill 时必死无疑
-//!
-//! ## 双层防护
+//! ## 图论模型
 //!
 //! ```text
-//! 外层（Martyr 负责）：HRTB 约束，防止 &T 逃逸
-//! 内层（NoLeakPledge 契约）：T 承诺不会通过方法返回指向自身内存布局的指针
+//! Arc ──→ Arc ──→ Martyr ──唯一边──→ T
+//! Arc ──↗          ↑
+//!              (多条入边指向壳)
 //! ```
 //!
-//! ## 使用方式
+//! - Martyr 到 T 的边是**唯一的**（`RwLock<Option<T>>`）
+//! - Martyr 自身可被 `Arc` 共享（壳有多条入边）
+//! - `kill()` = 切断唯一边 → T 不可达 → T 被销毁
+//! - `invoke()` = 通过唯一边代理访问（HRTB 防止引用逃逸）
 //!
-//! ```ignore
-//! use mmg_martyr::{Martyr, NoLeakPledge};
-//!
-//! struct MyResource { /* ... */ }
-//!
-//! // 1. 声明遵守契约
-//! impl NoLeakPledge for MyResource {}
-//!
-//! // 2. 为 Martyr<T> 实现 trait
-//! impl MyTrait for Martyr<MyResource> {
-//!     fn operation(&self) -> i32 {
-//!         self.__invoke(|r| r.compute()).unwrap_or(0)
-//!     }
-//! }
-//!
-//! // 3. 使用
-//! let martyr = Martyr::new(my_resource);
-//! martyr.operation();
-//! martyr.kill();
-//! ```
-
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+//! 只要没有第二个直接指针，图论保证资源不泄露。
 
 use parking_lot::RwLock;
 
-// ============================================================================
-// NoLeakPledge - 不泄露承诺
-// ============================================================================
+/// 唯一边已被切断，资源不可达。
+#[derive(Debug, PartialEq, thiserror::Error)]
+#[error("resource killed")]
+pub struct ResourceKilled;
 
-/// 不泄露承诺 — 宣誓类型不会泄露自身的内存布局
+/// 唯一指针守卫。
 ///
-/// # ⚠️ 警告：这是人工契约，编译器无法验证
+/// `Martyr(T) = RwLock(Option(T))`
 ///
-/// **实现此 trait 前，您必须诚实回答以下问题：**
-///
-/// 1. 类型 T 是否有方法返回指向 **T 自身内存布局** 的指针或引用？
-/// 2. 这些指针/引用是否会逃逸到 `__invoke` 闭包外部？
-///
-/// **如果答案为"是"，则必须确保这些引用只在 `__invoke` 闭包内使用，
-/// 最终返回值必须是 owned 值或 `'static` 生命周期。**
-///
-/// # 契约语义（精确定义）
-///
-/// 被 `Martyr<T>` 包装的资源 T，其**自身内存布局**（T 类型的结构体实例）
-/// 必须只能通过 Martyr 访问。具体而言：
-///
-/// - **受保护的**：T 自身的内存布局（struct 的字段们占据的连续内存）
-/// - **不受限制的**：T 内部字段所指向的其他内存（如 T 持有的 Arc 指向的资源）
-///
-/// ## 理解示例
-///
-/// ```text
-/// struct Scheduler {
-///     id: u64,                    // ← 这8字节属于 Scheduler 的内存布局
-///     pool: Arc<ConnectionPool>,  // ← 这16字节(指针)属于 Scheduler 的内存布局
-///                                 //   但 ConnectionPool 本身在另一段内存，不受保护
-/// }
-/// ```
-///
-/// Martyr 保护的是 Scheduler 的 24 字节，不是 ConnectionPool 的内存。
-/// 所以 `pool.clone()` 返回 Arc 是合法的——它指向第三方内存。
-///
-/// # 为什么不是 unsafe trait？
-///
-/// 这是一个**君子协定**。编译器无法验证这些规则，实现者必须人工保证。
-/// 违反契约不会导致内存安全问题（UB），只会导致 Martyr 的生命周期保护失效
-/// ——这是逻辑错误，不是内存错误。
-///
-/// # 合规示例
-///
-/// ```
-/// use mmg_martyr::NoLeakPledge;
-///
-/// // ✅ 纯值类型
-/// struct Counter { value: i32 }
-/// impl NoLeakPledge for Counter {}
-///
-/// // ✅ 原子类型
-/// struct AtomicState { flag: std::sync::atomic::AtomicBool }
-/// impl NoLeakPledge for AtomicState {}
-///
-/// // ✅ ZST（零大小类型）
-/// struct EmptyMarker;
-/// impl NoLeakPledge for EmptyMarker {}
-/// ```
-pub trait NoLeakPledge: Sized {}
-
-// ============================================================================
-// Martyr - 殉道者
-// ============================================================================
-
-/// 殉道者 — 资源的唯一守护者
-///
-/// # 内存布局
-///
-/// ```text
-/// Martyr<T>
-/// ├── inner: RwLock<Option<T>>  ← T 被 RwLock 保护
-/// ├── is_killed: AtomicBool     ← 死亡标记
-/// └── visitor_count: AtomicIsize ← 访客计数
-/// ```
+/// - `Some(T)` = 唯一边存在，资源可达
+/// - `None` = 唯一边已切断，资源已销毁
+/// - `RwLock` = 并发安全的读写互斥
+/// - HRTB 约束 = 闭包无法将 `&T` 逃逸到外部
 pub struct Martyr<T> {
-    /// 被保护的资源 — 通过 RwLock 保护，无需 unsafe
-    inner: RwLock<Option<T>>,
-    /// 死亡标记
-    is_killed: AtomicBool,
-    /// 访客计数（调试用）
-    visitor_count: AtomicIsize,
+    resource: RwLock<Option<T>>,
 }
 
-impl<T: NoLeakPledge> Martyr<T> {
-    /// 创建殉道者，托管资源
-    ///
-    /// 从此刻起，T 的内存布局只存在于 Martyr 内部。
+impl<T> Martyr<T> {
+    /// 建立从 Martyr 到 T 的唯一边。
     pub fn new(resource: T) -> Self {
         Self {
-            inner: RwLock::new(Some(resource)),
-            is_killed: AtomicBool::new(false),
-            visitor_count: AtomicIsize::new(0),
+            resource: RwLock::new(Some(resource)),
         }
     }
 
-    /// 杀死资源（非协商式）
+    /// 切断唯一边。T 不可达，立即销毁。
     ///
-    /// # Panics
-    ///
-    /// 当有访客正在访问时，触发殉葬（panic）。
-    pub fn kill(&self) {
-        // 获取写锁
-        let mut guard = self.inner.write();
-
-        // 标记死亡
-        self.is_killed.store(true, Ordering::SeqCst);
-
-        // 检查访客
-        let visitors = self.visitor_count.load(Ordering::SeqCst);
-        if visitors > 0 {
-            panic!(
-                "💀 [Martyr] {} visitors still accessing! Martyrdom triggered.",
-                visitors
-            );
-        }
-
-        // 销毁资源
-        if guard.take().is_some() {
-            tracing::debug!("✅ [Martyr] Resource killed cleanly.");
-        }
+    /// 返回 `true` 表示本次切断成功，`false` 表示边已不存在。
+    pub fn kill(&self) -> bool {
+        self.resource.write().take().is_some()
     }
 
-    /// 资源是否还活着
-    #[inline]
+    /// 唯一边是否仍然存在。
     pub fn is_alive(&self) -> bool {
-        !self.is_killed.load(Ordering::SeqCst)
+        self.resource.read().is_some()
     }
 
-    /// 代理调用 — **仅限 impl Trait for Martyr<T> 使用**
+    /// 通过唯一边代理读访问。
     ///
-    /// # ⚠️ 警告：危险的内部 API
-    ///
-    /// 双下划线前缀表示这是一个**需要理解契约才能使用**的方法。
-    ///
-    /// # HRTB 约束
-    ///
-    /// `for<'a> FnOnce(&'a T) -> R` 确保返回值 `R` 不依赖 `&T` 的生命周期。
-    /// 这从编译层面阻止了 `&T` 或其内部引用逃逸到闭包外部。
-    ///
-    /// # 正确用法
-    ///
-    /// ```ignore
-    /// // ✅ 返回值类型（Copy 或 owned）
-    /// self.__invoke(|r| r.get_count())
-    ///
-    /// // ✅ 内部引用在闭包内消费，返回 owned 值
-    /// self.__invoke(|r| r.endpoint().to_string())
-    ///
-    /// // ✅ 返回 T 持有的外部 Arc 克隆（指向第三方内存）
-    /// self.__invoke(|r| r.connection_pool.clone())
-    ///
-    /// // ✅ 返回 'static Future（必须完全自包含）
-    /// self.__invoke(|r| r.create_request())  // 返回 BoxFuture<'static, ...>
-    /// ```
-    #[doc(hidden)]
-    pub fn __invoke<F, R>(&self, f: F) -> Result<R, MartyrError>
+    /// HRTB 约束 `for<'a> FnOnce(&'a T) -> R` 确保 `&T` 无法逃逸。
+    pub fn invoke<F, R>(&self, f: F) -> Result<R, ResourceKilled>
     where
         F: for<'a> FnOnce(&'a T) -> R,
     {
-        // 检查是否已死
-        if self.is_killed.load(Ordering::SeqCst) {
-            return Err(MartyrError::ResourceKilled);
+        let guard = self.resource.read();
+        match guard.as_ref() {
+            Some(resource) => Ok(f(resource)),
+            None => Err(ResourceKilled),
         }
-
-        // 获取读锁
-        let guard = self.inner.read();
-
-        // 访客登记
-        self.visitor_count.fetch_add(1, Ordering::SeqCst);
-        let _visitor = VisitorGuard {
-            count: &self.visitor_count,
-        };
-
-        // 执行操作
-        let resource = guard.as_ref().ok_or(MartyrError::ResourceKilled)?;
-        Ok(f(resource))
     }
 
-    /// 可变代理调用 — **仅限 impl Trait for Martyr<T> 使用**
+    /// 通过唯一边代理写访问。
     ///
-    /// 参见 `__invoke` 的文档说明。
-    #[doc(hidden)]
-    pub fn __invoke_mut<F, R>(&self, f: F) -> Result<R, MartyrError>
+    /// HRTB 约束 `for<'a> FnOnce(&'a mut T) -> R` 确保 `&mut T` 无法逃逸。
+    pub fn invoke_mut<F, R>(&self, f: F) -> Result<R, ResourceKilled>
     where
         F: for<'a> FnOnce(&'a mut T) -> R,
     {
-        // 检查是否已死
-        if self.is_killed.load(Ordering::SeqCst) {
-            return Err(MartyrError::ResourceKilled);
-        }
-
-        // 获取写锁
-        let mut guard = self.inner.write();
-
-        // 访客登记
-        self.visitor_count.fetch_add(1, Ordering::SeqCst);
-        let _visitor = VisitorGuard {
-            count: &self.visitor_count,
-        };
-
-        // 执行操作
-        let resource = guard.as_mut().ok_or(MartyrError::ResourceKilled)?;
-        Ok(f(resource))
-    }
-}
-
-impl<T> Drop for Martyr<T> {
-    fn drop(&mut self) {
-        if !self.is_killed.load(Ordering::SeqCst) {
-            self.is_killed.store(true, Ordering::SeqCst);
-            let visitors = self.visitor_count.load(Ordering::SeqCst);
-            if visitors > 0 {
-                panic!(
-                    "💀 [Martyr] Dropped with {} visitors! Martyrdom triggered.",
-                    visitors
-                );
-            }
+        let mut guard = self.resource.write();
+        match guard.as_mut() {
+            Some(resource) => Ok(f(resource)),
+            None => Err(ResourceKilled),
         }
     }
 }
-
-// ============================================================================
-// VisitorGuard - RAII 访客守卫
-// ============================================================================
-
-struct VisitorGuard<'a> {
-    count: &'a AtomicIsize,
-}
-
-impl Drop for VisitorGuard<'_> {
-    fn drop(&mut self) {
-        self.count.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-// ============================================================================
-// MartyrError - 错误类型
-// ============================================================================
-
-/// Martyr 错误
-#[derive(Debug, thiserror::Error)]
-pub enum MartyrError {
-    /// 资源已被杀死
-    #[error("resource has been killed")]
-    ResourceKilled,
-}
-
-// ============================================================================
-// 测试
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
 
-    struct Counter {
-        value: i32,
-    }
-
-    impl NoLeakPledge for Counter {}
+    struct Counter(i32);
 
     impl Counter {
-        fn new(value: i32) -> Self {
-            Self { value }
-        }
-
         fn get(&self) -> i32 {
-            self.value
+            self.0
         }
-
         fn increment(&mut self) {
-            self.value += 1;
-        }
-    }
-
-    trait CounterOps {
-        fn get_value(&self) -> i32;
-        fn inc(&self);
-    }
-
-    impl CounterOps for Martyr<Counter> {
-        fn get_value(&self) -> i32 {
-            self.__invoke(|c| c.get()).unwrap_or(0)
-        }
-
-        fn inc(&self) {
-            let _ = self.__invoke_mut(|c| c.increment());
+            self.0 += 1;
         }
     }
 
     #[test]
-    fn test_basic_proxy() {
-        let martyr = Martyr::new(Counter::new(42));
-        assert_eq!(martyr.get_value(), 42);
-        martyr.inc();
-        assert_eq!(martyr.get_value(), 43);
+    fn invoke_delegates_to_resource() {
+        let m = Martyr::new(Counter(42));
+        assert_eq!(m.invoke(|c| c.get()), Ok(42));
     }
 
     #[test]
-    fn test_kill() {
-        let martyr = Martyr::new(Counter::new(42));
-        assert!(martyr.is_alive());
-        martyr.kill();
-        assert!(!martyr.is_alive());
-        assert_eq!(martyr.get_value(), 0);
+    fn invoke_mut_modifies_resource() {
+        let m = Martyr::new(Counter(0));
+        m.invoke_mut(|c| c.increment()).unwrap();
+        assert_eq!(m.invoke(|c| c.get()), Ok(1));
     }
 
     #[test]
-    fn test_arc_sharing() {
-        let martyr = Arc::new(Martyr::new(Counter::new(42)));
-        let martyr2 = Arc::clone(&martyr);
-
-        assert_eq!(martyr.get_value(), 42);
-        assert_eq!(martyr2.get_value(), 42);
-
-        martyr2.kill();
-
-        assert!(!martyr.is_alive());
-        assert!(!martyr2.is_alive());
+    fn kill_severs_the_edge() {
+        let m = Martyr::new(Counter(42));
+        assert!(m.is_alive());
+        assert!(m.kill());
+        assert!(!m.is_alive());
+        assert!(m.invoke(|c| c.get()).is_err());
+        // Second kill returns false (already dead)
+        assert!(!m.kill());
     }
 
     #[test]
-    fn test_concurrent_access() {
-        use std::thread;
+    fn arc_sharing_single_edge() {
+        let m = Arc::new(Martyr::new(Counter(42)));
+        let m2 = Arc::clone(&m);
+        // Multiple paths to shell, but only one edge to resource
+        assert_eq!(m.invoke(|c| c.get()), Ok(42));
+        assert_eq!(m2.invoke(|c| c.get()), Ok(42));
+        // Any holder can sever the edge
+        m.kill();
+        assert!(!m2.is_alive());
+        assert!(m2.invoke(|c| c.get()).is_err());
+    }
 
-        let martyr = Arc::new(Martyr::new(Counter::new(0)));
+    #[test]
+    fn concurrent_access() {
+        let m = Arc::new(Martyr::new(Counter(0)));
         let mut handles = vec![];
-
         for _ in 0..10 {
-            let m = Arc::clone(&martyr);
-            handles.push(thread::spawn(move || {
+            let m = Arc::clone(&m);
+            handles.push(std::thread::spawn(move || {
                 for _ in 0..100 {
-                    m.inc();
+                    let _ = m.invoke_mut(|c| c.increment());
                 }
             }));
         }
-
         for h in handles {
             h.join().unwrap();
         }
-
-        assert_eq!(martyr.get_value(), 1000);
+        assert_eq!(m.invoke(|c| c.get()), Ok(1000));
     }
 }
